@@ -1,0 +1,136 @@
+#!/bin/bash
+# ============================================================
+#  exp —— 管理多个 claude 实验会话(每个实验 = 一个独立节点/作业)
+#
+#  用法:
+#    exp init                  生成默认配置文件(首次使用先跑这个)
+#    exp start  <name>         申请一个节点,开一个名叫 <name> 的持久会话,2 秒后自动进入
+#    exp attach <name>         进入 <name> 实验(进去后手动敲 claude)
+#    exp list                  列出我所有正在跑的实验
+#    exp stop   <name>         释放 <name> 的节点资源
+#    exp stopall               释放我全部实验节点
+#
+#  指定别的配置文件(放在子命令前面):
+#    exp -c /path/to/other.conf start <name>
+# ============================================================
+
+# 默认配置文件位置(可改这里,或用 -c / 环境变量 EXP_CONFIG 覆盖)
+DEFAULT_CONFIG="$HOME/.config/exp/exp.conf"
+
+# ---- 解析可选的 -c/--config <路径>,必须放在子命令之前 ----
+CONFIG=""
+if [ "$1" = "-c" ] || [ "$1" = "--config" ]; then
+    CONFIG="$2"
+    shift 2
+fi
+# 优先级: 命令行 -c  >  环境变量 EXP_CONFIG  >  默认位置
+CONFIG="${CONFIG:-${EXP_CONFIG:-$DEFAULT_CONFIG}}"
+
+SUB=$1
+NAME=$2
+
+# ---- init: 生成一份默认配置文件 ----
+if [ "$SUB" = "init" ]; then
+    if [ -f "$CONFIG" ]; then
+        echo "配置文件已存在: $CONFIG (不覆盖)。直接编辑它即可: nano $CONFIG"
+        exit 0
+    fi
+    mkdir -p "$(dirname "$CONFIG")"
+    cat > "$CONFIG" << CONF
+# ===== exp 配置文件 =====
+# 改设置只动这个文件,脚本本身不用碰。
+WORKDIR=$PWD              # 实验工作目录,默认取 init 时所在目录
+PREFIX=cc-                # 作业名前缀,区分"我的实验作业"和别的作业
+TIME=9:00:00              # 每个实验申请的时长
+EXCLUDE=xcng0,xcng1       # 不想被分到的节点(逗号隔开)
+# PARTITION=long          # 需要指定分区时,取消本行注释
+CONF
+    echo "已生成默认配置: $CONFIG"
+    echo "用 'nano $CONFIG' 编辑里面的设置。"
+    exit 0
+fi
+
+# ---- 载入配置 ----
+if [ -f "$CONFIG" ]; then
+    source "$CONFIG"
+else
+    echo "找不到配置文件: $CONFIG"
+    echo "先运行 'exp init' 生成一份,或用 'exp -c <路径> ...' 指定已有的配置。"
+    exit 1
+fi
+
+JOB="${PREFIX}${NAME}"
+
+usage() {
+    echo "用法: exp [-c 配置文件] {init|start|attach|list|stop|stopall} [name]"
+    echo "  init            生成默认配置文件"
+    echo "  start  <name>   申请节点并开一个持久会话,2 秒后自动进入"
+    echo "  attach <name>   进入该实验(进去后手动敲 claude)"
+    echo "  list            列出我所有实验"
+    echo "  stop   <name>   释放该实验的节点"
+    echo "  stopall         释放我全部实验节点"
+    echo "当前使用的配置文件: $CONFIG"
+}
+
+need_name() {
+    [ -n "$NAME" ] || { echo "缺少实验名。"; usage; exit 1; }
+}
+
+attach_exp() {
+    JOBID=$(squeue -u "$USER" -n "$JOB" -h -t RUNNING -o "%i" | head -n1)
+    if [ -z "$JOBID" ]; then
+        if squeue -u "$USER" -n "$JOB" -h -t PENDING -o "%i" | grep -q .; then
+            echo "实验 '$NAME' 还在排队 (PENDING),稍等再试: exp attach $NAME"
+        else
+            echo "没有正在运行的实验 '$NAME'。先: exp start $NAME"
+        fi
+        return 1
+    fi
+    echo "进入实验 '$NAME' (作业 $JOBID)... 进去后敲 claude;脱离按 Ctrl+B 再 D"
+    srun --jobid="$JOBID" --overlap --pty tmux attach -t "$JOB"
+}
+
+case "$SUB" in
+  start)
+    need_name
+    if squeue -u "$USER" -n "$JOB" -h -o "%i" | grep -q .; then
+        echo "实验 '$NAME' 已存在,直接进入: exp attach $NAME"
+        exit 1
+    fi
+    sbatch --job-name="$JOB" \
+           --time="$TIME" \
+           --exclude="$EXCLUDE" \
+           ${PARTITION:+--partition="$PARTITION"} \
+           --wrap="tmux kill-session -t '$JOB' 2>/dev/null; tmux new-session -d -s '$JOB' -c '$WORKDIR'; sleep infinity" \
+        || exit 1
+    echo "实验 '$NAME' 已提交,2 秒后尝试自动进入..."
+    sleep 2
+    attach_exp
+    ;;
+
+  attach)
+    need_name
+    attach_exp
+    ;;
+
+  list)
+    squeue -u "$USER" -o "%.12i %.22j %.9T %.11M %.6D %R" \
+      | awk -v p="$PREFIX" 'NR==1 || index($2,p)==1'
+    ;;
+
+  stop)
+    need_name
+    scancel -u "$USER" --name="$JOB" && echo "已释放实验 '$NAME' 的节点。"
+    ;;
+
+  stopall)
+    IDS=$(squeue -u "$USER" -h -o "%i %j" | awk -v p="$PREFIX" '$2 ~ "^"p {print $1}')
+    [ -n "$IDS" ] || { echo "当前没有实验在跑。"; exit 0; }
+    echo "$IDS" | xargs scancel
+    echo "已释放全部实验节点。"
+    ;;
+
+  *)
+    usage
+    ;;
+esac
